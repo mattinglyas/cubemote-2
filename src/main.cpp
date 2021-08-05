@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include <string.h>
 #include <esp_timer.h>
@@ -27,8 +28,10 @@ extern "C"
 #define RMT_RX_GPIO_NUM GPIO_NUM_16
 #define RMT_TX_GPIO_NUM GPIO_NUM_17
 #define RMT_RX_CHANNEL RMT_CHANNEL_0
-#define RMT_TX_CHANNEL RMT_CHANNEL_1
+#define RMT_TX_CHANNEL RMT_CHANNEL_2
 #define RMT_CLK_DIV 40
+#define RMT_RX_IDLE_THRESHOLD_US 9500
+#define RMT_CLOCK_SPEED 80000000
 
 /*************************************************************************
  * Pins
@@ -45,10 +48,16 @@ static uint8_t nsi_frame_size_bytes;
 static uint8_t nsi_response[NSI_FRAME_MAX];
 static uint16_t nsi_response_size_bits;
 
+static rmt_config_t rx_config;
+static rmt_config_t tx_config;
+
+static rmt_item32_t items[NSI_FRAME_MAX * 8];
+
 /*************************************************************************
  * Methods
  * 
  *************************************************************************/
+
 static uint16_t IRAM_ATTR construct_response(uint8_t command, uint8_t *bytes)
 {
     switch (command)
@@ -58,7 +67,7 @@ static uint16_t IRAM_ATTR construct_response(uint8_t command, uint8_t *bytes)
         bytes[1] = 0x00;
         bytes[2] = 0x03;
         bytes[3] = 0x80; // stop bit
-        return 24;
+        return 25;
         break;
     case CONSOLE_PROBE_ORIGIN:
         bytes[0] = 0x00; // 0, 0, 0, start, y, x, b, a
@@ -123,7 +132,7 @@ static uint16_t IRAM_ATTR bytes_to_nsi(uint8_t *bytes, rmt_item32_t *nsi, uint16
     uint16_t nsi_idx = 0;
     uint8_t nsi_mask = 0;
 
-    do
+    while (nsi_idx < length)
     {
         byte_idx = nsi_idx >> 3;
         nsi_mask = 1 << (nsi_idx & 0x07);
@@ -146,7 +155,7 @@ static uint16_t IRAM_ATTR bytes_to_nsi(uint8_t *bytes, rmt_item32_t *nsi, uint16
         }
 
         nsi_idx++;
-    } while (nsi_idx != length);
+    }
 
     return nsi_idx;
 }
@@ -201,8 +210,6 @@ static void IRAM_ATTR rmt_isr(void *arg)
                 command = bytes_to_console_command(nsi_frame);
                 nsi_response_size_bits = construct_response(command, nsi_response);
 
-                rmt_rx_stop(RMT_RX_CHANNEL);
-
                 ets_printf("%02x: ", command);
                 for (uint8_t i = 0; i < nsi_frame_size_bytes; i++)
                 {
@@ -214,8 +221,6 @@ static void IRAM_ATTR rmt_isr(void *arg)
                     ets_printf("%02x ", nsi_response[i]);
                 }
                 ets_printf("\n");
-
-                rmt_rx_start(RMT_RX_CHANNEL, true);
             }
 
             RMT.conf_ch[channel].conf1.mem_wr_rst = 1;
@@ -236,51 +241,92 @@ static void IRAM_ATTR rmt_isr(void *arg)
 
 void rmt_rx_init()
 {
-    rmt_config_t config;
-    config.channel = RMT_RX_CHANNEL;
-    config.gpio_num = RMT_RX_GPIO_NUM;
-    config.clk_div = RMT_CLK_DIV;
-    config.mem_block_num = 1;
-    config.rmt_mode = RMT_MODE_RX;
+    rx_config.channel = RMT_RX_CHANNEL;
+    rx_config.gpio_num = RMT_RX_GPIO_NUM;
+    rx_config.clk_div = RMT_CLK_DIV;
+    rx_config.mem_block_num = 4;
+    rx_config.rmt_mode = RMT_MODE_RX;
 
-    config.rx_config.filter_en = 0;
-    config.rx_config.filter_ticks_thresh = 0;
-    config.rx_config.idle_threshold = (NSI_BIT_PERIOD_TICKS * 4);
+    rx_config.rx_config.filter_en = 0;
+    rx_config.rx_config.filter_ticks_thresh = 0;
+    rx_config.rx_config.idle_threshold = (NSI_BIT_PERIOD_TICKS * 4); //RMT_RX_IDLE_THRESHOLD_US / 10 * (RMT_CLOCK_SPEED / RMT_CLK_DIV) / 100000;
 
-    rmt_config(&config);
-    rmt_set_rx_intr_en(config.channel, 1);
-    rmt_set_err_intr_en(config.channel, 1);
+    rmt_config(&rx_config);
 }
 
 void rmt_tx_init()
 {
-    rmt_config_t config;
-    config.channel = RMT_TX_CHANNEL;
-    config.gpio_num = RMT_TX_GPIO_NUM;
-    config.mem_block_num = 1;
-    config.clk_div = RMT_CLK_DIV;
+    tx_config.channel = RMT_TX_CHANNEL;
+    tx_config.gpio_num = RMT_TX_GPIO_NUM;
+    tx_config.mem_block_num = 1;
+    tx_config.clk_div = RMT_CLK_DIV;
+    tx_config.rmt_mode = RMT_MODE_TX;
 
-    config.tx_config.loop_en = false;
-    config.tx_config.carrier_freq_hz = 24000000;
-    config.tx_config.carrier_level = RMT_CARRIER_LEVEL_HIGH;
-    config.tx_config.carrier_en = false;
-    config.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
-    config.tx_config.idle_output_en = false;
+    tx_config.tx_config.carrier_freq_hz = 24000000;
+    tx_config.tx_config.carrier_level = RMT_CARRIER_LEVEL_HIGH;
+    tx_config.tx_config.idle_level = RMT_IDLE_LEVEL_HIGH;
+    tx_config.tx_config.carrier_duty_percent = 50;
+    tx_config.tx_config.carrier_en = false;
+    tx_config.tx_config.loop_en = false;
+    tx_config.tx_config.idle_output_en = true;
 
-    config.rmt_mode = RMT_MODE_TX;
-    rmt_config(&config);
-    rmt_set_tx_intr_en(config.channel, false);
-    rmt_set_tx_thr_intr_en(config.channel, false, 0);
-
-    rmt_driver_install(config.channel, 0, 0);
+    rmt_config(&tx_config);
 }
 
 void app_main()
 {
-    rmt_isr_register(rmt_isr, NULL, 0, NULL);
+    //rmt_isr_register(rmt_isr, NULL, 0, NULL);
 
-    //rmt_tx_init();
+    rmt_tx_init();
     rmt_rx_init();
 
-    rmt_rx_start(RMT_RX_CHANNEL, 1);
+    rmt_driver_install(tx_config.channel, 0, 0);
+    rmt_driver_install(rx_config.channel, 3000, 0);
+
+    RingbufHandle_t rx_ring_buffer = NULL;
+    rmt_get_ringbuf_handle(rx_config.channel, &rx_ring_buffer);
+
+    rmt_rx_start(rx_config.channel, 1);
+
+    for (;;)
+    {
+        //nsi_response_size_bits = construct_response(CONSOLE_PROBE, nsi_response);
+        //bytes_to_nsi(nsi_response, items, nsi_response_size_bits);
+        //rmt_write_items(tx_config.channel, items, nsi_response_size_bits, 1);
+
+        size_t rx_size = 0;
+        rmt_item32_t *item = (rmt_item32_t *)xRingbufferReceive(rx_ring_buffer, &rx_size, portMAX_DELAY);
+
+        if (item)
+        {
+            nsi_frame_size_bytes = nsi_to_bytes(item, nsi_frame);
+            vRingbufferReturnItem(rx_ring_buffer, (void *)item);
+
+            //rmt_rx_stop(rx_config.channel);
+
+            uint8_t command = bytes_to_console_command(nsi_frame);
+            nsi_response_size_bits = construct_response(command, nsi_response);
+            bytes_to_nsi(nsi_response, items, nsi_response_size_bits);
+            
+            ets_printf("%02x: ", command);
+            for (uint8_t i = 0; i < nsi_frame_size_bytes; i++)
+            {
+                ets_printf("%02x ", nsi_frame[i]);
+            }
+
+            if (command != CONSOLE_INVALID) 
+            {
+                rmt_write_items(tx_config.channel, items, nsi_response_size_bits, 1);
+                
+                ets_printf("-> ");
+                for (uint8_t i = 0; i < ((nsi_response_size_bits >> 3) + ((nsi_response_size_bits & 0x03) != 0)); i++)
+                {
+                    ets_printf("%02x ", nsi_response[i]);
+                }
+                ets_printf("\n");
+            }   
+
+            //rmt_rx_start(rx_config.channel, 0);
+        }
+    }
 }
